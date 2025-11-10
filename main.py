@@ -2,17 +2,18 @@ import os
 import hashlib
 import hmac
 import secrets
-from typing import List, Optional, Literal
+import json
+from typing import List, Optional, Literal, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from math import comb
+from math import comb, floor
 from datetime import datetime, timezone
 from bson import ObjectId
 
 from database import db, create_document, get_documents
 
-app = FastAPI(title="Plinko Lab API", version="1.0.0")
+app = FastAPI(title="Plinko Lab API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,7 +24,7 @@ app.add_middleware(
 )
 
 
-# ---------------------- Provably-Fair Helpers ----------------------
+# ---------------------- Generic Helpers ----------------------
 
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
@@ -32,6 +33,9 @@ def sha256_hex(s: str) -> str:
 def hmac_sha256_hex(key: str, msg: str) -> str:
     return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
+
+# ---------------------- Engine v1 (HMAC-based) ----------------------
+# Existing simple engine kept for backwards-compatibility
 
 def rand_unit_from_hex(hexstr: str) -> float:
     # Use first 13 hex chars -> 52 bits of precision for a [0,1) float
@@ -100,6 +104,107 @@ def simulate_plinko(server_seed: str, client_seed: str, nonce: int, rows: int, r
     }
 
 
+# ---------------------- Engine v2 (Deterministic Discrete per spec) ----------------------
+# Implements commitHex, combinedSeed, peg map generation with xorshift32 PRNG, path decisions and hashing
+
+class XorShift32:
+    def __init__(self, seed: int):
+        if seed == 0:
+            seed = 0x6D2B79F5  # avoid zero lock state
+        self.state = seed & 0xFFFFFFFF
+
+    def next_u32(self) -> int:
+        x = self.state
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17) & 0xFFFFFFFF
+        x ^= (x << 5) & 0xFFFFFFFF
+        self.state = x & 0xFFFFFFFF
+        return self.state
+
+    def rand(self) -> float:
+        # Returns float in [0,1)
+        return self.next_u32() / 4294967296.0  # 2**32
+
+
+def seed_from_combined_hex(combined_hex: str) -> int:
+    # First 4 bytes (8 hex chars), big-endian
+    return int(combined_hex[:8], 16)
+
+
+def stable_float6(x: float) -> float:
+    # Round to 6 decimals for stable hashing and representation
+    return float(f"{x:.6f}")
+
+
+def stable_json(data) -> str:
+    # Deterministic JSON: ensure floats as 6dp strings in pegMap
+    def default(o):
+        if isinstance(o, float):
+            return float(f"{o:.6f}")
+        raise TypeError
+    return json.dumps(data, separators=(",", ":"))
+
+
+def generate_peg_map(rows: int, prng: XorShift32) -> List[List[float]]:
+    peg_map: List[List[float]] = []
+    for r in range(rows):
+        row = []
+        for _ in range(r + 1):
+            rnd = prng.rand()
+            left_bias = 0.5 + (rnd - 0.5) * 0.2  # in [0.4, 0.6]
+            row.append(stable_float6(left_bias))
+        peg_map.append(row)
+    return peg_map
+
+
+def peg_map_hash(peg_map: List[List[float]]) -> str:
+    # Hash JSON of peg_map with 6dp floats
+    s = json.dumps(peg_map, separators=(",", ":"))
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def simulate_discrete_engine(server_seed: str, client_seed: str, nonce: str, rows: int, drop_column: int) -> Tuple[dict, List[str]]:
+    if rows != 12:
+        # The spec uses 12; allow other values but default 12
+        rows = 12
+    # commit and combined
+    commit_hex = sha256_hex(f"{server_seed}:{nonce}")
+    combined_hex = sha256_hex(f"{server_seed}:{client_seed}:{nonce}")
+    prng = XorShift32(seed_from_combined_hex(combined_hex))
+    # peg map then path decisions share one PRNG stream
+    peg_map = generate_peg_map(rows, prng)
+    peg_hash = peg_map_hash(peg_map)
+
+    # path decisions
+    pos = 0
+    path: List[str] = []
+    center = rows // 2
+    adj = (drop_column - center) * 0.01
+
+    for r in range(rows):
+        peg_idx = pos if pos < (r + 1) else r
+        base_bias = peg_map[r][peg_idx]
+        bias_prime = max(0.0, min(1.0, base_bias + adj))
+        rnd = prng.rand()
+        if rnd < bias_prime:
+            path.append("L")
+        else:
+            path.append("R")
+            pos += 1
+
+    result = {
+        "commitHex": commit_hex,
+        "combinedSeed": combined_hex,
+        "pegMapHash": peg_hash,
+        "binIndex": pos,
+        "pegMap": peg_map,
+        "path": path,
+        "rows": rows,
+        "dropColumn": drop_column,
+    }
+    return result, path
+
+
 # ---------------------- Data Models ----------------------
 
 class CommitResponse(BaseModel):
@@ -143,6 +248,37 @@ class VerifyQuery(BaseModel):
     bet_amount: Optional[float] = None
 
 
+# New protocol models
+class CommitV2Response(BaseModel):
+    roundId: str
+    commitHex: str
+    nonce: str
+    status: str = "CREATED"
+
+
+class StartV2Request(BaseModel):
+    clientSeed: str
+    betCents: int = Field(ge=0)
+    dropColumn: int = Field(0, ge=0, le=12)
+
+
+class StartV2Response(BaseModel):
+    roundId: str
+    rows: int
+    pegMapHash: str
+    binIndex: int
+    payoutMultiplier: float
+    path: List[str]
+    status: str
+
+
+class RevealV2Response(BaseModel):
+    roundId: str
+    serverSeed: str
+    revealedAt: datetime
+    status: str
+
+
 # ---------------------- API Routes ----------------------
 
 @app.get("/")
@@ -181,6 +317,8 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     return response
 
+
+# ---------- Existing simple endpoints (kept) ----------
 
 @app.post("/api/commit", response_model=CommitResponse)
 def commit_round():
@@ -303,24 +441,141 @@ def get_round(round_id: str):
     return doc
 
 
-@app.get("/api/verify")
-def verify(server_seed: str, client_seed: str, nonce: int = 0, rows: int = 16, risk: str = "medium", bet_amount: Optional[float] = None):
-    # Compute deterministic outcome without DB
-    sim = simulate_plinko(server_seed=server_seed, client_seed=client_seed, nonce=nonce, rows=rows, risk=risk)
-    payout = (bet_amount * sim["multiplier"]) if bet_amount is not None else None
-    return {
-        "server_seed_hash": sha256_hex(server_seed),
-        "server_seed": server_seed,
-        "client_seed": client_seed,
+# -------------- New endpoints for Deterministic Discrete Engine --------------
+
+@app.post("/api/rounds/commit", response_model=CommitV2Response)
+def v2_commit_round():
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    server_seed = secrets.hex_bytes(32).hex()
+    nonce = str(secrets.randbelow(10**9))
+    commit_hex = sha256_hex(f"{server_seed}:{nonce}")
+
+    doc = {
+        "type": "round",
+        "status": "CREATED",
+        "serverSeed": server_seed,
         "nonce": nonce,
+        "commitHex": commit_hex,
+        "createdAt": datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    inserted_id = db["round"].insert_one(doc).inserted_id
+    return CommitV2Response(roundId=str(inserted_id), commitHex=commit_hex, nonce=nonce)
+
+
+@app.post("/api/rounds/{round_id}/start", response_model=StartV2Response)
+def v2_start_round(round_id: str, payload: StartV2Request):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        _id = ObjectId(round_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid round id")
+
+    doc = db["round"].find_one({"_id": _id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    server_seed = doc["serverSeed"]
+    nonce = doc["nonce"]
+    rows = 12
+
+    sim, path = simulate_discrete_engine(
+        server_seed=server_seed,
+        client_seed=payload.clientSeed,
+        nonce=nonce,
+        rows=rows,
+        drop_column=payload.dropColumn,
+    )
+
+    # Simple symmetric paytable: edges higher, center lower (example constants)
+    # Here we shape using binomial probability reciprocal, then normalize EV~=1
+    probs = [comb(rows, k) / (2 ** rows) for k in range(rows + 1)]
+    base = [1.0 / p for p in probs]
+    ev = sum(p * m for p, m in zip(probs, base))
+    factor = 1.0 / ev
+    paytable = [m * factor for m in base]
+
+    mult = float(paytable[sim["binIndex"]])
+
+    update = {
+        "status": "STARTED",
+        "clientSeed": payload.clientSeed,
+        "combinedSeed": sim["combinedSeed"],
+        "pegMapHash": sim["pegMapHash"],
         "rows": rows,
-        "risk": risk,
+        "dropColumn": payload.dropColumn,
+        "binIndex": sim["binIndex"],
+        "payoutMultiplier": mult,
+        "betCents": payload.betCents,
+        "pathJson": sim["path"],
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    db["round"].update_one({"_id": _id}, {"$set": update})
+
+    return StartV2Response(
+        roundId=round_id,
+        rows=rows,
+        pegMapHash=sim["pegMapHash"],
+        binIndex=sim["binIndex"],
+        payoutMultiplier=mult,
+        path=sim["path"],
+        status="STARTED",
+    )
+
+
+@app.post("/api/rounds/{round_id}/reveal", response_model=RevealV2Response)
+def v2_reveal_round(round_id: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        _id = ObjectId(round_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid round id")
+
+    doc = db["round"].find_one({"_id": _id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Round not found")
+
+    if doc.get("status") not in ("STARTED", "CREATED", "REVEALED"):
+        raise HTTPException(status_code=400, detail="Invalid status transition")
+
+    revealed_at = datetime.now(timezone.utc)
+    db["round"].update_one({"_id": _id}, {"$set": {"status": "REVEALED", "revealedAt": revealed_at}})
+
+    return RevealV2Response(roundId=round_id, serverSeed=doc["serverSeed"], revealedAt=revealed_at, status="REVEALED")
+
+
+@app.get("/api/rounds/detail/{round_id}")
+def v2_get_round(round_id: str):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        _id = ObjectId(round_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid round id")
+    doc = db["round"].find_one({"_id": _id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    doc["id"] = str(doc.pop("_id"))
+    if doc.get("status") != "REVEALED":
+        doc.pop("serverSeed", None)
+    return doc
+
+
+@app.get("/api/verify")
+def verify(server_seed: str, client_seed: str, nonce: str = "0", rows: int = 12, drop_column: int = 6):
+    # Deterministic discrete engine verify
+    sim, _ = simulate_discrete_engine(server_seed=server_seed, client_seed=client_seed, nonce=nonce, rows=rows, drop_column=drop_column)
+    return {
+        "commitHex": sim["commitHex"],
+        "combinedSeed": sim["combinedSeed"],
+        "pegMapHash": sim["pegMapHash"],
+        "binIndex": sim["binIndex"],
+        "rows": sim["rows"],
+        "dropColumn": sim["dropColumn"],
         "path": sim["path"],
-        "bucket": sim["bucket"],
-        "multiplier": sim["multiplier"],
-        "payout": payout,
-        "multipliers": sim["multipliers"],
-        "rng_values": sim["rng_values"],
     }
 
 
